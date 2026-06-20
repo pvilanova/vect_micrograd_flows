@@ -103,6 +103,113 @@ def svm_loss(model, X, y, alpha=1e-4):
     return data_loss + reg_loss, accuracy
 
 
+
+# ---------------------------------------------------------------------------
+# Flow training helpers
+# ---------------------------------------------------------------------------
+
+def save_state(model):
+    """Return a copy of all model parameters.
+
+    This lightweight state format is used by the example notebooks to keep
+    the best validation checkpoint without introducing serialization code.
+    """
+    return [param.data.copy() for param in model.parameters()]
+
+
+def load_state(model, state):
+    """Restore parameters previously produced by :func:`save_state`.
+
+    Args:
+        model: Model with a ``parameters()`` method.
+        state: Sequence of NumPy arrays returned by ``save_state(model)``.
+
+    Raises:
+        ValueError: if the number of arrays does not match the model.
+    """
+    params = list(model.parameters())
+    if len(params) != len(state):
+        raise ValueError(f"state has {len(state)} arrays but model has {len(params)} parameters")
+
+    for param, saved in zip(params, state):
+        param.data[...] = saved
+
+
+def full_nll(model, X, batch_size=2048):
+    """Compute the average negative log-likelihood over ``X`` in batches."""
+    total = 0.0
+    n_total = len(X)
+    if n_total == 0:
+        raise ValueError("X must contain at least one example")
+
+    for start in range(0, n_total, batch_size):
+        xb = X[start : start + batch_size]
+        n = len(xb)
+        total += model.nll(xb).item() * n
+
+    return total / n_total
+
+
+def grad_global_norm(parameters, fail_on_non_finite=True):
+    """Return the global L2 norm of all available parameter gradients.
+
+    Args:
+        parameters: Iterable of ``Value`` parameters.
+        fail_on_non_finite: If True, raise ``FloatingPointError`` when a
+            gradient contains NaN or infinity. If False, return ``np.nan``.
+    """
+    total_sq = 0.0
+
+    for i, param in enumerate(parameters):
+        if param.grad is None:
+            continue
+
+        grad64 = param.grad.astype(np.float64, copy=False)
+        if not np.all(np.isfinite(grad64)):
+            msg = f"non-finite gradient in parameter {i} with shape {param.data.shape}"
+            if fail_on_non_finite:
+                raise FloatingPointError(msg)
+            return np.nan
+
+        total_sq += float((grad64 ** 2).sum())
+
+    return total_sq ** 0.5
+
+
+def clip_grad_norm(parameters, max_norm=5.0):
+    """Clip gradients to a maximum global L2 norm.
+
+    Returns the unclipped norm, matching PyTorch's ``clip_grad_norm_`` style.
+    """
+    params = list(parameters)
+    total_norm = grad_global_norm(params, fail_on_non_finite=True)
+    scale = min(1.0, max_norm / (total_norm + 1e-12))
+
+    if scale < 1.0:
+        for param in params:
+            if param.grad is not None:
+                param.grad *= scale
+
+    return total_norm
+
+
+def init_flow_near_identity(model, output_scale=0.01):
+    """Initialize coupling transforms near the identity map.
+
+    Coupling layers with a ``net`` attribute have their final dense layer scaled
+    down. If the model exposes a final ``scaling`` transform, its log-scales are
+    reset to zero. This is useful for the toy flow notebooks.
+    """
+    for layer in model.flow:
+        if hasattr(layer, "net"):
+            last = layer.net.layers[-1]
+            last.W.data *= output_scale
+            if last.b is not None:
+                last.b.data.fill(0.0)
+
+    if hasattr(model, "scaling"):
+        model.scaling.log_s.data.fill(0.0)
+
 # ---------------------------------------------------------------------------
 # Checkpointing
 # ---------------------------------------------------------------------------
