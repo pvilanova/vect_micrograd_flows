@@ -440,9 +440,22 @@ class NormalizingFlow(Module):
         """Mean negative log-likelihood for a minibatch."""
         return -self.log_prob(x).mean()
 
-    def sample(self, n: int, dtype=DEFAULT_DTYPE):
-        """Draw samples from the model as a NumPy array."""
+    def sample(self, n: int, dtype=DEFAULT_DTYPE, temperature: float = 1.0):
+        """Draw samples from the model as a NumPy array.
+
+        Args:
+            n: Number of examples to sample.
+            dtype: NumPy dtype for the latent draw.
+            temperature: Optional latent-temperature multiplier.  Values below
+                1.0 sample from a higher-density region of the learned model.
+                This is a visualization/sampling heuristic and does not affect
+                likelihood evaluation.
+        """
+        if temperature <= 0.0:
+            raise ValueError("temperature must be positive")
         z = self.prior.sample(n, dtype=dtype)
+        if temperature != 1.0:
+            z = z * np.array(temperature, dtype=dtype)
         return self.inverse(Value(z, requires_grad=False)).data
 
     def parameters(self):

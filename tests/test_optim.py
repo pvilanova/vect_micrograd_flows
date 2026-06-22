@@ -64,3 +64,28 @@ def test_rmsprop_tracks_current_learning_rate_schedule():
     opt.step(50)
 
     assert np.isclose(opt.current_lr, opt._current_lr(50))
+
+
+def test_rmsprop_can_use_denominator_floor_for_nice_style_update():
+    p = Value(np.array([1.0, -2.0], dtype=np.float64))
+    p.grad = np.array([0.5, -0.25], dtype=np.float64)
+    opt = RMSProp([p], lr=0.1, rho=0.95, eps=1e-2, eps_mode="max")
+
+    old_data = p.data.copy()
+    grad = p.grad.copy()
+    square_avg = 0.05 * grad ** 2
+    expected = old_data - 0.1 * grad / np.maximum(np.sqrt(square_avg), 1e-2)
+
+    opt.step(0)
+
+    assert np.allclose(opt.square_avg[0], square_avg)
+    assert np.allclose(p.data, expected)
+
+
+def test_rmsprop_exponential_decay_with_min_lr_matches_nice_style_schedule():
+    p = Value(np.array([1.0], dtype=np.float64))
+    opt = RMSProp([p], lr=1e-3, rho=0.95, eps=1e-2, min_lr=1e-4, lr_decay_factor=1.0005)
+
+    assert np.isclose(opt._current_lr(0), 1e-3)
+    assert np.isclose(opt._current_lr(100), 1e-3 / (1.0005 ** 100))
+    assert np.isclose(opt._current_lr(100_000), 1e-4)

@@ -149,11 +149,14 @@ def test_normalizing_flow_log_prob_and_sample_shape():
 
     logp = model.log_prob(x_data)
     samples = model.sample(11, dtype=np.float64)
+    low_temp_samples = model.sample(11, dtype=np.float64, temperature=0.8)
 
     assert logp.data.shape == (7,)
     assert samples.shape == (11, 2)
+    assert low_temp_samples.shape == (11, 2)
     assert np.all(np.isfinite(logp.data))
     assert np.all(np.isfinite(samples))
+    assert np.all(np.isfinite(low_temp_samples))
 
 
 def test_make_nice_flow_default_is_additive_round_trip():
