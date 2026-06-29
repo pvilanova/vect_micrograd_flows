@@ -201,6 +201,7 @@ print("sample shape:", samples.shape)
 
 - `flow_two_moons_micrograd.ipynb`
 - `flow_8_gaussians_micrograd.ipynb`
+- MNIST inpainting example
 
 The notebooks plot:
 
@@ -223,22 +224,6 @@ flow_kind = "realnvp"
 
 to run the affine Real NVP-style model.
 
-## Project layout
-
-```text
-vect_micrograd/
-  vect_engine.py   # vectorized reverse-mode autodiff Value
-  vect_nn.py       # Module, Layer, MLP helpers
-  flows.py         # priors, transforms, FlowSequential, NormalizingFlow, builders
-  optim.py         # SGD, Adam, Lion
-
-tests/
-  test_value.py
-  test_flows.py
-
-flow_two_moons_micrograd.ipynb
-flow_8_gaussians_micrograd.ipynb
-```
 ## References
 
 This project is based on the normalizing-flow view of density estimation: learn an
