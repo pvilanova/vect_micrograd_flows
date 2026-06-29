@@ -1,64 +1,84 @@
 # vect_micrograd normalizing flows
 
-A small, didactic implementation of normalizing flows using the vectorized NumPy
-micrograd engine (http://github.com/pvilanova/vect_micrograd_plus).
+A compact, educational implementation of normalizing flows using a vectorized
+NumPy micrograd [vect_micrograd](https://github.com/pvilanova/vect_micrograd). 
 
-The project implements two closely related flow families:
+The repository currently focuses on two coupling-flow families:
 
-- **NICE** — additive coupling layers plus a final diagonal scaling layer.
-- **Real NVP** — affine coupling layers with input-dependent log-determinants.
+- **NICE** — additive coupling layers plus a final learned diagonal scaling
+  layer.
+- **Real NVP-style affine flows** — affine coupling layers with input-dependent
+  log-determinants.
 
-The goal is educational: keep the implementation compact enough to inspect, while
-still supporting exact log-likelihood, exact latent inference, exact sampling, and
-reverse-mode autodiff.
+The code is intended for learning, experimentation, and small reproductions.  It
+is not meant to compete with PyTorch/JAX/Theano for performance on large models.
 
-## Why both NICE and Real NVP?
+## Quickstart
 
-NICE introduced the coupling-layer idea in a form that is very easy to understand:
-part of the input is copied unchanged, and the other part is shifted by a neural
-network conditioned on the copied part.
-
-```text
-y_id     = x_id
-y_change = x_change + t(x_id)
-logdet   = 0
+```bash
+pip install -e .
+python -m pytest -q
 ```
 
-Because additive coupling is volume-preserving, NICE adds a final learned diagonal
-scaling layer:
+## Repository layout
 
 ```text
-z = exp(s) * h
-log |det J| = sum_i s_i
+vect_micrograd/
+  vect_engine.py   # vectorized NumPy autograd engine
+  vect_nn.py       # small neural-network layers used inside couplings
+  flows.py         # priors, coupling layers, scaling, permutations, flow API
+  optim.py         # SGD, Adam, Lion, RMSProp, NICE/Pylearn2 momentum schedule
+  utils.py         # training/checkpoint/diagnostic helpers
+
+tests/
+  test_value.py
+  test_flows.py
+  test_optim.py
+
+flow_two_moons_micrograd.ipynb
+flow_8_gaussians_micrograd.ipynb
+flow_mnist_nice_rmsprop_micrograd.ipynb
+1410.8516v6.pdf
 ```
 
-Real NVP extends the coupling layer from additive to affine:
+## Autograd engine notes
 
-```text
-y_id     = x_id
-y_change = x_change * exp(s(x_id)) + t(x_id)
-logdet   = sum_j s_j(x_id)
-```
+`vect_micrograd/vect_engine.py` keeps the micrograd design: operations create a
+dynamic DAG and `backward()` performs reverse-mode autodiff over that DAG.  The
+main difference from scalar micrograd is that each node contains a NumPy array.
 
-That extra scale network gives the model input-dependent local compression and
-expansion. In practice, Real NVP-style affine coupling usually fits toy densities
-such as two moons better than additive NICE.
+The current engine includes a few practical optimizations that matter for the
+flow notebooks:
 
-## Design
+- lazy gradient allocation: intermediate `Value.grad` buffers are allocated only
+  when a backward contribution arrives;
+- a fast backward path for ordinary slicing such as `x[:, :d]`, which is heavily
+  used by coupling layers;
+- safe fallback behavior for advanced indexing through `np.add.at`;
+- standard NumPy broadcasting-aware gradient accumulation.
 
-The code is intentionally organized around generic flow components, not around a
-single monolithic `NICE` class.
+Because this is still a dynamic Python autograd engine, long training runs and
+pixel-space inpainting are much slower than compiled autodiff systems.  Small
+floating-point differences can also be amplified by long optimization runs, so
+fixed random seeds make runs reproducible in practice but should not be expected
+to guarantee bitwise equality across engine revisions, BLAS settings, or Python
+processes.
+
+## Flow API
+
+The code is organized around reusable flow components rather than a single
+monolithic model class.
 
 ```text
 base distribution + invertible transform stack = normalizing flow
 ```
 
-Core pieces:
+Core components include:
 
 - `StandardNormal`
 - `StandardLogistic`
-- `AdditiveCoupling` for NICE-style coupling
-- `AffineCoupling` for Real NVP-style coupling
+- `AdditiveCoupling`
+- `AffineCoupling`
 - `DiagonalScaling`
 - `Reverse`
 - `Permute`
@@ -68,7 +88,7 @@ Core pieces:
 - `make_realnvp_flow(...)`
 - `make_flow(kind=...)`
 
-Every transform follows the same interface:
+Each transform follows the same convention:
 
 ```python
 z, logdet = transform.forward(x)
@@ -76,22 +96,34 @@ x = transform.inverse(z)
 params = transform.parameters()
 ```
 
-`NormalizingFlow` supplies the density-model API:
+`NormalizingFlow` provides the density-model interface:
 
 ```python
 logp = model.log_prob(x)  # per-example log p(x), shape (batch,)
 loss = model.nll(x)       # mean negative log-likelihood, scalar Value
-x = model.sample(1024)    # NumPy array sampled through the inverse flow
+x = model.sample(1024)    # NumPy samples generated by the inverse flow
 ```
 
-## Quickstart
+## NICE
 
-```bash
-pip install -e .
-python -m pytest -q
+NICE uses additive coupling layers.  One part of the input is copied unchanged,
+and the other part is shifted by a neural network conditioned on the copied part:
+
+```text
+y_id     = x_id
+y_change = x_change + t(x_id)
+logdet   = 0
 ```
 
-## NICE example
+Because additive coupling is volume-preserving, a final learned diagonal scaling
+layer supplies a global log-determinant:
+
+```text
+z = exp(s) * h
+log |det J| = sum_i s_i
+```
+
+Example:
 
 ```python
 from vect_micrograd.flows import make_nice_flow
@@ -107,13 +139,22 @@ model = make_nice_flow(
 optimizer = Adam(model.parameters(), lr=5e-4)
 ```
 
-This builds a paper-faithful NICE-style flow:
+## Real NVP-style affine coupling
+
+Real NVP-style affine coupling extends the NICE coupling transform by adding an
+input-dependent scale:
 
 ```text
-AdditiveCoupling -> AdditiveCoupling -> ... -> DiagonalScaling -> prior
+y_id     = x_id
+y_change = x_change * exp(s(x_id)) + t(x_id)
+logdet   = sum_j s_j(x_id)
 ```
 
-## Real NVP example
+This gives the model local compression and expansion.  In the toy notebooks,
+affine coupling usually fits two moons and eight Gaussians better than pure
+additive NICE.
+
+Example:
 
 ```python
 from vect_micrograd.flows import make_realnvp_flow
@@ -130,13 +171,7 @@ model = make_realnvp_flow(
 optimizer = Adam(model.parameters(), lr=5e-4)
 ```
 
-This builds a Real NVP-style flow:
-
-```text
-AffineCoupling -> AffineCoupling -> ... -> prior
-```
-
-A final `DiagonalScaling` can also be added to Real NVP-style models with:
+A final diagonal scaling layer can also be added to affine models:
 
 ```python
 model = make_realnvp_flow(
@@ -149,8 +184,8 @@ model = make_realnvp_flow(
 
 ## Generic builder
 
-The notebooks use the generic builder so the same training code can switch
-between NICE and Real NVP:
+The toy notebooks use the generic builder so the same training loop can switch
+between additive NICE and affine Real NVP-style coupling:
 
 ```python
 from vect_micrograd.flows import make_flow
@@ -167,8 +202,8 @@ model = make_flow(
 )
 ```
 
-For `kind="nice"`, pass only arguments accepted by `make_nice_flow`. For
-`kind="realnvp"`, pass Real NVP-specific options such as `max_log_scale`.
+For `kind="nice"`, pass only options accepted by `make_nice_flow`.  For
+`kind="realnvp"`, pass affine-specific options such as `max_log_scale`.
 
 ## Minimal training loop
 
@@ -179,7 +214,7 @@ from vect_micrograd.flows import make_realnvp_flow
 from vect_micrograd.optim import Adam
 
 rng = np.random.default_rng(0)
-X = rng.standard_normal((4096, 2)).astype(np.float64)
+X = rng.standard_normal((4096, 2)).astype(np.float32)
 
 model = make_realnvp_flow(dim=2, hidden_sizes=(64, 64), num_coupling_layers=4)
 optimizer = Adam(model.parameters(), lr=5e-4, weight_decay=0.0)
@@ -199,36 +234,73 @@ print("sample shape:", samples.shape)
 
 ## Demo notebooks
 
-- `flow_two_moons_micrograd.ipynb`
-- `flow_8_gaussians_micrograd.ipynb`
-- MNIST inpainting example
+### `flow_two_moons_micrograd.ipynb`
 
-The notebooks plot:
+Trains a 2-D flow on the two-moons dataset.  The notebook is useful for seeing
+why affine coupling is often more expressive than additive coupling on curved toy
+densities.
 
-1. The toy dataset.
-2. Mini-batch and full-data NLL curves.
-3. Real samples vs. generated samples.
-4. Learned relative log-density on a 2-D grid.
+### `flow_8_gaussians_micrograd.ipynb`
 
-Use:
+Trains a 2-D flow on the standard eight-Gaussians ring dataset.  This is a good
+stress test for multimodality and mode coverage.
+
+### `flow_mnist_nice_rmsprop_micrograd.ipynb`
+
+Trains an additive NICE model on continuously dequantized MNIST.  The notebook
+uses:
+
+- 50,000 training images and 10,000 validation images from the MNIST training
+  split;
+- fresh dequantization noise for every training minibatch;
+- fixed validation/test dequantization arrays;
+- odd/even input ordering followed by additive coupling layers;
+- a final diagonal scaling layer;
+- a logistic prior;
+- `RMSProp` with NICE/Pylearn2-style momentum, denominator floor, and learning
+  rate decay.
+
+The final section implements official-style NICE inpainting based on Laurent
+Dinh's `pylearn2/scripts/reconstruct_mnist_gif.py`: noisy gradient ascent on the
+missing pixels with observed pixels copied back after every update.  The original
+script uses `sqrt_iter=70`, which means 111,895 pixel-update steps.  In this
+micrograd implementation, smaller values such as 30--40 are more practical for
+quick tests; the full 100-image mask layout remains available through a flag in
+the notebook.
+
+## Optimizers
+
+`vect_micrograd.optim` includes several simple optimizers.  The MNIST notebook
+uses the `RMSProp` implementation with options chosen to match the NICE/Pylearn2
+style as closely as this project intends:
 
 ```python
-flow_kind = "nice"
+from vect_micrograd.optim import RMSProp, epoch_momentum
+
+optimizer = RMSProp(
+    model.parameters(),
+    lr=1e-3,
+    rho=0.95,
+    eps=1e-2,
+    eps_mode="max",
+    min_lr=1e-4,
+    lr_decay_factor=1.0005,
+)
+
+# in the epoch loop
+optimizer.step(global_step, momentum=epoch_momentum(epoch))
 ```
 
-to run the additive NICE model, and:
+With these settings the update is:
 
-```python
-flow_kind = "realnvp"
+```text
+avg      = rho * avg + (1 - rho) * grad**2
+denom    = max(sqrt(avg), eps)
+velocity = momentum * velocity - lr * grad / denom
+param    = param + velocity
 ```
-
-to run the affine Real NVP-style model.
 
 ## References
-
-This project is based on the normalizing-flow view of density estimation: learn an
-invertible transformation between data space and a simple latent distribution, while
-keeping both sampling and exact log-likelihood evaluation tractable.
 
 - Laurent Dinh, David Krueger, and Yoshua Bengio.  
   **NICE: Non-linear Independent Components Estimation.**  
@@ -240,8 +312,6 @@ keeping both sampling and exact log-likelihood evaluation tractable.
   arXiv:1605.08803, 2016.  
   https://arxiv.org/abs/1605.08803
 
-- Danilo Jimenez Rezende and Shakir Mohamed.  
-  **Variational Inference with Normalizing Flows.**  
-  ICML 2015.  
-  https://arxiv.org/abs/1505.05770
-
+- Laurent Dinh.  
+  **Official NICE implementation.**  
+  https://github.com/laurent-dinh/nice
