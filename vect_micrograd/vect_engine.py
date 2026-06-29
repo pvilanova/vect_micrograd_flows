@@ -4,6 +4,13 @@ This keeps the micrograd idea (dynamic DAG + reverse-mode autodiff), but each
 Value stores a whole NumPy array instead of one Python scalar. That changes the
 cost of a dense layer from thousands of tiny scalar nodes to a handful of array
 ops: matmul, add, ReLU, sum/mean.
+
+Performance-oriented version:
+- lazy gradient allocation: Value.grad starts as None and is allocated only when
+  a gradient contribution actually arrives;
+- in-place zero_grad for already-allocated gradients;
+- fast backward path for ordinary slicing;
+- sum backward uses broadcasting instead of np.ones_like(...) temporaries.
 """
 
 from __future__ import annotations
@@ -59,6 +66,41 @@ def _unbroadcast(grad: np.ndarray, shape: tuple[int, ...]) -> np.ndarray:
     return grad.reshape(shape)
 
 
+def _add_grad(v: "Value", grad) -> None:
+    """Accumulate a gradient contribution into v with lazy allocation.
+
+    The original engine eagerly allocated ``np.zeros_like(data)`` for every
+    differentiable intermediate. That is simple, but expensive for deep dynamic
+    graphs. This helper allocates only when a contribution arrives.
+    """
+    if not v.requires_grad:
+        return
+    if grad is None:
+        return
+
+    grad_arr = np.asarray(grad, dtype=v.data.dtype)
+    if v.grad is None:
+        # Copy because grad may be a view/broadcasted view or may be reused by
+        # the caller. After this point v owns its gradient buffer.
+        v.grad = np.array(grad_arr, dtype=v.data.dtype, copy=True)
+    else:
+        v.grad += grad_arr
+
+
+def _is_basic_index(idx) -> bool:
+    """Return True for ordinary NumPy indexing where ``grad[idx] += ...`` is safe.
+
+    Advanced integer/boolean-array indexing can contain repeated indices. In
+    those cases ``grad[idx] += out.grad`` is not a correct scatter-add, so we
+    fall back to np.add.at.
+    """
+    if not isinstance(idx, tuple):
+        idx = (idx,)
+
+    basic_types = (slice, int, np.integer, type(Ellipsis), type(None))
+    return all(isinstance(part, basic_types) for part in idx)
+
+
 class Value:
     """Stores a NumPy array and its gradient."""
 
@@ -67,7 +109,10 @@ class Value:
     def __init__(self, data, _children=(), _op: str = "", requires_grad: bool = True, dtype=None):
         self.data = _as_array(data, dtype=dtype)
         self.requires_grad = requires_grad
-        self.grad = np.zeros_like(self.data) if requires_grad else None
+
+        # Lazy gradient allocation: no gradient buffer is created until a
+        # backward pass actually contributes to this Value.
+        self.grad = None
 
         # Internal variables used for autograd graph construction.
         self._backward = lambda: None
@@ -92,16 +137,27 @@ class Value:
     def __getitem__(self, idx):
         """Differentiable NumPy-style slicing/indexing.
 
-        The backward pass scatters the upstream gradient back into the original
-        array shape. np.add.at handles repeated advanced indices correctly.
+        Fast path:
+            ordinary slicing writes directly into ``self.grad[idx]`` and avoids
+            a full temporary plus np.add.at.
+
+        Fallback:
+            advanced indexing uses np.add.at so repeated indices are handled
+            correctly.
         """
         out = Value(self.data[idx], (self,), "slice", self.requires_grad)
+        basic_index = _is_basic_index(idx)
 
         def _backward():
-            if self.requires_grad:
-                grad = np.zeros_like(self.data)
-                np.add.at(grad, idx, out.grad)
-                self.grad += grad
+            if self.requires_grad and out.grad is not None:
+                if basic_index:
+                    if self.grad is None:
+                        self.grad = np.zeros_like(self.data)
+                    self.grad[idx] += out.grad
+                else:
+                    grad = np.zeros_like(self.data)
+                    np.add.at(grad, idx, out.grad)
+                    _add_grad(self, grad)
 
         out._backward = _backward
         return out
@@ -113,8 +169,8 @@ class Value:
         out = Value(self.data.reshape(*shape), (self,), "reshape", self.requires_grad)
 
         def _backward():
-            if self.requires_grad:
-                self.grad += out.grad.reshape(self.data.shape)
+            if self.requires_grad and out.grad is not None:
+                _add_grad(self, out.grad.reshape(self.data.shape))
 
         out._backward = _backward
         return out
@@ -124,12 +180,12 @@ class Value:
         out = Value(np.transpose(self.data, axes=axes), (self,), "transpose", self.requires_grad)
 
         def _backward():
-            if self.requires_grad:
+            if self.requires_grad and out.grad is not None:
                 if axes is None:
-                    self.grad += np.transpose(out.grad)
+                    _add_grad(self, np.transpose(out.grad))
                 else:
                     inverse_axes = np.argsort(axes)
-                    self.grad += np.transpose(out.grad, axes=inverse_axes)
+                    _add_grad(self, np.transpose(out.grad, axes=inverse_axes))
 
         out._backward = _backward
         return out
@@ -156,31 +212,41 @@ class Value:
         sizes = [v.data.shape[axis_norm] for v in vals]
 
         def _backward():
+            if out.grad is None:
+                return
             start = 0
             for v, size in zip(vals, sizes):
                 end = start + size
                 if v.requires_grad:
                     slices = [slice(None)] * ndim
                     slices[axis_norm] = slice(start, end)
-                    v.grad += out.grad[tuple(slices)]
+                    _add_grad(v, out.grad[tuple(slices)])
                 start = end
 
         out._backward = _backward
         return out
 
     def zero_grad(self):
-        if self.requires_grad:
-            self.grad = np.zeros_like(self.data)
+        """Clear this Value's gradient.
+
+        If a gradient buffer already exists, zero it in-place. If no gradient
+        has ever been allocated, keep it as None. This preserves the lazy
+        allocation benefit while avoiding repeated allocation in training loops.
+        """
+        if self.requires_grad and self.grad is not None:
+            self.grad.fill(0.0)
 
     def __add__(self, other):
         other = _ensure_value(other, dtype=self.data.dtype)
         out = Value(self.data + other.data, (self, other), "+", self.requires_grad or other.requires_grad)
 
         def _backward():
+            if out.grad is None:
+                return
             if self.requires_grad:
-                self.grad += _unbroadcast(out.grad, self.data.shape)
+                _add_grad(self, _unbroadcast(out.grad, self.data.shape))
             if other.requires_grad:
-                other.grad += _unbroadcast(out.grad, other.data.shape)
+                _add_grad(other, _unbroadcast(out.grad, other.data.shape))
 
         out._backward = _backward
         return out
@@ -190,10 +256,12 @@ class Value:
         out = Value(self.data * other.data, (self, other), "*", self.requires_grad or other.requires_grad)
 
         def _backward():
+            if out.grad is None:
+                return
             if self.requires_grad:
-                self.grad += _unbroadcast(other.data * out.grad, self.data.shape)
+                _add_grad(self, _unbroadcast(other.data * out.grad, self.data.shape))
             if other.requires_grad:
-                other.grad += _unbroadcast(self.data * out.grad, other.data.shape)
+                _add_grad(other, _unbroadcast(self.data * out.grad, other.data.shape))
 
         out._backward = _backward
         return out
@@ -269,29 +337,31 @@ class Value:
         out = Value(self.data @ other.data, (self, other), "@", self.requires_grad or other.requires_grad)
 
         def _backward():
+            if out.grad is None:
+                return
             # Common dense-layer case: (batch, in) @ (in, out).
             if self.data.ndim == 2 and other.data.ndim == 2:
                 if self.requires_grad:
-                    self.grad += out.grad @ other.data.T
+                    _add_grad(self, out.grad @ other.data.T)
                 if other.requires_grad:
-                    other.grad += self.data.T @ out.grad
+                    _add_grad(other, self.data.T @ out.grad)
             # Convenience cases for vectors. They are less important for MLPs,
             # but make the operator usable in small experiments.
             elif self.data.ndim == 1 and other.data.ndim == 2:
                 if self.requires_grad:
-                    self.grad += out.grad @ other.data.T
+                    _add_grad(self, out.grad @ other.data.T)
                 if other.requires_grad:
-                    other.grad += np.outer(self.data, out.grad)
+                    _add_grad(other, np.outer(self.data, out.grad))
             elif self.data.ndim == 2 and other.data.ndim == 1:
                 if self.requires_grad:
-                    self.grad += np.outer(out.grad, other.data)
+                    _add_grad(self, np.outer(out.grad, other.data))
                 if other.requires_grad:
-                    other.grad += self.data.T @ out.grad
+                    _add_grad(other, self.data.T @ out.grad)
             elif self.data.ndim == 1 and other.data.ndim == 1:
                 if self.requires_grad:
-                    self.grad += other.data * out.grad
+                    _add_grad(self, other.data * out.grad)
                 if other.requires_grad:
-                    other.grad += self.data * out.grad
+                    _add_grad(other, self.data * out.grad)
             else:
                 raise NotImplementedError(
                     "matmul backward currently supports only 1D/2D operands; "
@@ -306,8 +376,8 @@ class Value:
         out = Value(self.data**other, (self,), f"**{other}", self.requires_grad)
 
         def _backward():
-            if self.requires_grad:
-                self.grad += other * (self.data ** (other - 1)) * out.grad
+            if self.requires_grad and out.grad is not None:
+                _add_grad(self, other * (self.data ** (other - 1)) * out.grad)
 
         out._backward = _backward
         return out
@@ -316,8 +386,8 @@ class Value:
         out = Value(np.maximum(self.data, 0), (self,), "ReLU", self.requires_grad)
 
         def _backward():
-            if self.requires_grad:
-                self.grad += (self.data > 0) * out.grad
+            if self.requires_grad and out.grad is not None:
+                _add_grad(self, (self.data > 0) * out.grad)
 
         out._backward = _backward
         return out
@@ -327,8 +397,8 @@ class Value:
         out = Value(t, (self,), "tanh", self.requires_grad)
 
         def _backward():
-            if self.requires_grad:
-                self.grad += (1 - t**2) * out.grad
+            if self.requires_grad and out.grad is not None:
+                _add_grad(self, (1 - t**2) * out.grad)
 
         out._backward = _backward
         return out
@@ -350,8 +420,8 @@ class Value:
         out = Value(loss, (self,), "softmax_ce", self.requires_grad)
 
         def _backward():
-            if self.requires_grad:
-                self.grad += ((probs - targets) / n) * out.grad
+            if self.requires_grad and out.grad is not None:
+                _add_grad(self, ((probs - targets) / n) * out.grad)
 
         out._backward = _backward
         return out, probs
@@ -388,10 +458,10 @@ class Value:
         out = Value(loss, (self,), "softmax_ce_sparse", self.requires_grad)
 
         def _backward():
-            if self.requires_grad:
+            if self.requires_grad and out.grad is not None:
                 grad = probs.copy()
                 grad[rows, targets] -= 1.0
-                self.grad += (grad / batch_size) * out.grad
+                _add_grad(self, (grad / batch_size) * out.grad)
 
         out._backward = _backward
         return out, probs
@@ -401,8 +471,8 @@ class Value:
         out = Value(e, (self,), "exp", self.requires_grad)
 
         def _backward():
-            if self.requires_grad:
-                self.grad += e * out.grad
+            if self.requires_grad and out.grad is not None:
+                _add_grad(self, e * out.grad)
 
         out._backward = _backward
         return out
@@ -411,8 +481,8 @@ class Value:
         out = Value(np.log(self.data), (self,), "log", self.requires_grad)
 
         def _backward():
-            if self.requires_grad:
-                self.grad += (1 / self.data) * out.grad
+            if self.requires_grad and out.grad is not None:
+                _add_grad(self, (1 / self.data) * out.grad)
 
         out._backward = _backward
         return out
@@ -423,14 +493,14 @@ class Value:
         out = Value(data, (self,), "softplus", self.requires_grad)
 
         def _backward():
-            if self.requires_grad:
+            if self.requires_grad and out.grad is not None:
                 # Stable sigmoid derivative of softplus.
                 pos = self.data >= 0
                 sigmoid = np.empty_like(self.data)
                 sigmoid[pos] = 1.0 / (1.0 + np.exp(-self.data[pos]))
                 exp_x = np.exp(self.data[~pos])
                 sigmoid[~pos] = exp_x / (1.0 + exp_x)
-                self.grad += sigmoid * out.grad
+                _add_grad(self, sigmoid * out.grad)
 
         out._backward = _backward
         return out
@@ -439,11 +509,19 @@ class Value:
         out = Value(self.data.sum(axis=axis, keepdims=keepdims), (self,), "sum", self.requires_grad)
 
         def _backward():
-            grad = out.grad
-            if axis is not None and not keepdims:
-                grad = np.expand_dims(grad, axis)
-            if self.requires_grad:
-                self.grad += np.ones_like(self.data) * grad
+            if self.requires_grad and out.grad is not None:
+                grad = out.grad
+
+                if axis is not None and not keepdims:
+                    axes = axis if isinstance(axis, tuple) else (axis,)
+                    axes = tuple(ax if ax >= 0 else ax + self.data.ndim for ax in axes)
+                    for ax in sorted(axes):
+                        grad = np.expand_dims(grad, ax)
+
+                # Avoid np.ones_like(self.data) * grad. broadcast_to creates a
+                # view when possible; _add_grad copies only if this is the first
+                # gradient contribution to self.
+                _add_grad(self, np.broadcast_to(grad, self.data.shape))
 
         out._backward = _backward
         return out
@@ -486,7 +564,11 @@ class Value:
             if grad.shape != self.data.shape:
                 raise ValueError(f"grad shape {grad.shape} does not match Value shape {self.data.shape}")
 
-        self.grad = grad
+        # Seed output gradient. If backward is called repeatedly without
+        # zero_grad, accumulate in micrograd style instead of silently replacing
+        # existing gradients on the output node.
+        _add_grad(self, grad)
+
         for v in reversed(topo):
             v._backward()
 
