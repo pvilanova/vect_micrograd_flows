@@ -1,5 +1,10 @@
 # vect_micrograd normalizing flows
 
+<p align="center">
+  <img src="ocho.png" alt="8 Gaussians demo" width="45%">
+  <img src="two_moons.png" alt="2 Moons demo" width="45%">
+</p>
+
 A compact, educational implementation of normalizing flows using a vectorized
 NumPy micrograd [vect_micrograd](https://github.com/pvilanova/vect_micrograd). 
 
